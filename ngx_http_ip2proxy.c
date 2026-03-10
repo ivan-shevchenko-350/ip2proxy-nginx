@@ -352,7 +352,6 @@ ngx_http_ip2proxy_database(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 	}
 
 	if (ip2proxy_bin_handler){
-		//close the bin if it's still opened
 		IP2Proxy_close(ip2proxy_bin_handler);
 		ip2proxy_bin_handler = NULL;
 	}
@@ -364,7 +363,6 @@ ngx_http_ip2proxy_database(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 		return NGX_CONF_ERROR;
 	}
 
-	// Open IP2Proxy BIN database
 	gcf->handler = IP2Proxy_open((char *) value[1].data);
 	ip2proxy_bin_handler = gcf->handler;
 
@@ -439,10 +437,10 @@ ngx_http_ip2proxy_cidr_value(ngx_conf_t *cf, ngx_str_t *net, ngx_cidr_t *cidr)
 static void
 ngx_http_ip2proxy_cleanup(void *data)
 {
-	//ngx_http_ip2proxy_conf_t	*gcf = data;
+	ngx_http_ip2proxy_conf_t	*gcf = data;
 
-	// if (gcf->handler) {
-	// 	IP2Proxy_close(gcf->handler);
-	// 	gcf->handler = NULL;
-	// }
+	if (gcf->handler) {
+		IP2Proxy_close(gcf->handler);
+		gcf->handler = NULL;
+	}
 }
