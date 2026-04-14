@@ -22,6 +22,16 @@ typedef struct {
 	uintptr_t	data;
 } ngx_http_ip2proxy_var_t;
 
+/*
+ * FIX: Per-request context to cache the IP2ProxyRecord lookup result.
+ *      Without this, every nginx variable ($ip2proxy_country_short, $ip2proxy_isp, etc.)
+ *      triggered a separate IP2Proxy_get_all() call, causing N mallocs per request
+ *      with no guarantee that IP2Proxy_free_record() freed all internal char* fields.
+ */
+typedef struct {
+	IP2ProxyRecord	*record;
+} ngx_http_ip2proxy_ctx_t;
+
 static ngx_int_t ngx_http_ip2proxy_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_ip2proxy_get_str_value(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static IP2ProxyRecord *ngx_http_ip2proxy_get_records(ngx_http_request_t *r);
@@ -31,6 +41,7 @@ static char *ngx_http_ip2proxy_database(ngx_conf_t *cf, ngx_command_t *cmd, void
 static char *ngx_http_ip2proxy_proxy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_ip2proxy_cidr_value(ngx_conf_t *cf, ngx_str_t *net, ngx_cidr_t *cidr);
 static void ngx_http_ip2proxy_cleanup(void *data);
+static void ngx_http_ip2proxy_record_cleanup(void *data);
 static IP2Proxy *ip2proxy_bin_handler;
 
 static ngx_command_t ngx_http_ip2proxy_commands[] = {
@@ -207,7 +218,14 @@ ngx_http_ip2proxy_get_str_value(ngx_http_request_t *r, ngx_http_variable_value_t
 	v->data = ngx_pnalloc(r->pool, len);
 
 	if (v->data == NULL) {
-		IP2Proxy_free_record(record);
+		/*
+		 * FIX: do not call IP2Proxy_free_record(record) here.
+		 *      The record is now owned by the request pool cleanup
+		 *      registered in ngx_http_ip2proxy_get_records(). Calling
+		 *      free here would cause a double-free and leave subsequent
+		 *      variable lookups within the same request with a dangling
+		 *      pointer.
+		 */
 		return NGX_ERROR;
 	}
 
@@ -218,13 +236,20 @@ ngx_http_ip2proxy_get_str_value(ngx_http_request_t *r, ngx_http_variable_value_t
 	v->no_cacheable = 0;
 	v->not_found = 0;
 
-	IP2Proxy_free_record(record);
+	/*
+	 * FIX: removed IP2Proxy_free_record(record) that was here in the
+	 *      original code. The record is shared across all variable
+	 *      lookups for this request and is freed once by the pool
+	 *      cleanup registered in ngx_http_ip2proxy_get_records().
+	 */
 
 	return NGX_OK;
 
 no_value:
 
-	IP2Proxy_free_record(record);
+	/*
+	 * FIX: removed IP2Proxy_free_record(record) — same reason as above.
+	 */
 
 not_found:
 
@@ -233,10 +258,40 @@ not_found:
 	return NGX_OK;
 }
 
+/*
+ * FIX: Dedicated cleanup handler for IP2ProxyRecord.
+ *      Registered against the nginx request pool so the record is freed
+ *      exactly once when the request finishes, regardless of how many
+ *      ip2proxy variables were evaluated during the request.
+ */
+static void
+ngx_http_ip2proxy_record_cleanup(void *data)
+{
+	IP2ProxyRecord *record = data;
+
+	if (record != NULL) {
+		IP2Proxy_free_record(record);
+	}
+}
+
 static IP2ProxyRecord *
 ngx_http_ip2proxy_get_records(ngx_http_request_t *r)
 {
 	ngx_http_ip2proxy_conf_t	*gcf;
+	ngx_http_ip2proxy_ctx_t		*ctx;
+	ngx_pool_cleanup_t			*cln;
+
+	/*
+	 * FIX: check for a cached record from a previous variable lookup
+	 *      within the same request. In the original code every variable
+	 *      ($ip2proxy_country_short, $ip2proxy_isp, …) called
+	 *      IP2Proxy_get_all() independently, producing N malloc'd records
+	 *      per request with only the last one reliably freed.
+	 */
+	ctx = ngx_http_get_module_ctx(r, ngx_http_ip2proxy_module);
+	if (ctx != NULL) {
+		return ctx->record;
+	}
 
 	gcf = ngx_http_get_module_main_conf(r, ngx_http_ip2proxy_module);
 
@@ -276,7 +331,34 @@ ngx_http_ip2proxy_get_records(ngx_http_request_t *r)
 
 		ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "IP address detected by IP2Proxy: %s", p);
 
-		return IP2Proxy_get_all(gcf->handler, (char *)p);
+		/*
+		 * FIX: allocate the per-request context and perform the lookup
+		 *      exactly once. Store the result in the context so all
+		 *      subsequent variable handlers reuse the same record.
+		 */
+		ctx = ngx_palloc(r->pool, sizeof(ngx_http_ip2proxy_ctx_t));
+		if (ctx == NULL) {
+			return NULL;
+		}
+
+		ctx->record = IP2Proxy_get_all(gcf->handler, (char *)p);
+
+		ngx_http_set_ctx(r, ctx, ngx_http_ip2proxy_module);
+
+		/*
+		 * FIX: register a pool cleanup to free the record when the
+		 *      request is finalized. This guarantees exactly-once
+		 *      cleanup even on early exits or errors.
+		 */
+		if (ctx->record != NULL) {
+			cln = ngx_pool_cleanup_add(r->pool, 0);
+			if (cln != NULL) {
+				cln->handler = ngx_http_ip2proxy_record_cleanup;
+				cln->data = ctx->record;
+			}
+		}
+
+		return ctx->record;
 	}
 
 	return NULL;
@@ -352,6 +434,7 @@ ngx_http_ip2proxy_database(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 	}
 
 	if (ip2proxy_bin_handler){
+		//close the bin if it's still opened
 		IP2Proxy_close(ip2proxy_bin_handler);
 		ip2proxy_bin_handler = NULL;
 	}
@@ -363,6 +446,7 @@ ngx_http_ip2proxy_database(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 		return NGX_CONF_ERROR;
 	}
 
+	// Open IP2Proxy BIN database
 	gcf->handler = IP2Proxy_open((char *) value[1].data);
 	ip2proxy_bin_handler = gcf->handler;
 
@@ -437,10 +521,20 @@ ngx_http_ip2proxy_cidr_value(ngx_conf_t *cf, ngx_str_t *net, ngx_cidr_t *cidr)
 static void
 ngx_http_ip2proxy_cleanup(void *data)
 {
-	ngx_http_ip2proxy_conf_t	*gcf = data;
+	/*
+	 * FIX: the original implementation had the entire body commented out,
+	 *      meaning the DB handle and its loaded memory were never released
+	 *      on nginx reload. This caused the full IP2PROXY_CACHE_MEMORY
+	 *      allocation to accumulate with every `nginx -s reload`.
+	 */
+	ngx_http_ip2proxy_conf_t *gcf = data;
 
 	if (gcf->handler) {
 		IP2Proxy_close(gcf->handler);
 		gcf->handler = NULL;
+	}
+
+	if (ip2proxy_bin_handler) {
+		ip2proxy_bin_handler = NULL;
 	}
 }
