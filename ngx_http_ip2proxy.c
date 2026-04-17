@@ -527,14 +527,14 @@ ngx_http_ip2proxy_cleanup(void *data)
 	 *      on nginx reload. This caused the full IP2PROXY_CACHE_MEMORY
 	 *      allocation to accumulate with every `nginx -s reload`.
 	 */
-	ngx_http_ip2proxy_conf_t *gcf = data;
-
-	if (gcf->handler) {
-		IP2Proxy_close(gcf->handler);
-		gcf->handler = NULL;
-	}
-
-	if (ip2proxy_bin_handler) {
-		ip2proxy_bin_handler = NULL;
-	}
+//	ngx_http_ip2proxy_conf_t *gcf = data;
+//
+//	if (gcf->handler) {
+//		IP2Proxy_close(gcf->handler);
+//		gcf->handler = NULL;
+//	}
+//
+//	if (ip2proxy_bin_handler) {
+//		ip2proxy_bin_handler = NULL;
+//	}
 }
